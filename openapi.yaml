@@ -34,7 +34,9 @@ paths:
     put:
       operationId: put
       summary: Create the key, or update its value if it exists
-      description: The whole request body is stored as the value. It must be valid UTF-8 and may be empty.
+      description: >-
+        The whole request body is stored as the value. It must be valid UTF-8, may be empty, and may be
+        at most the server's --max-value-size bytes.
       requestBody:
         required: false
         content:
@@ -69,6 +71,14 @@ paths:
                 $ref: "#/components/schemas/Error"
               example:
                 error: key must be valid UTF-8 of at most 255 bytes
+        "413":
+          description: The value is larger than the server's --max-value-size.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: value is larger than 1048576 bytes
 
     get:
       operationId: get

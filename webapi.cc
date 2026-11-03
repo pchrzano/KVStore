@@ -6,13 +6,16 @@
 #include <seastar/core/smp.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/matchrules.hh>
-#include <seastar/util/short_streams.hh>
+#include <seastar/core/iostream.hh>
+#include <seastar/core/temporary_buffer.hh>
 
 #include "openapi_spec.hh"
 
 #include <chrono>
 #include <exception>
+#include <algorithm>
 #include <functional>
+#include <optional>
 #include <queue>
 #include <string>
 #include <utility>
@@ -56,6 +59,28 @@ public:
         return ss::make_ready_future<std::unique_ptr<ss::http::reply>>(std::move(rep));
     }
 };
+
+ss::future<std::optional<ss::sstring>> read_body(ss::input_stream<char>& in, size_t max_size) {
+    std::vector<ss::temporary_buffer<char>> chunks;
+    size_t total = 0;
+    while (true) {
+        ss::temporary_buffer<char> chunk = co_await in.read();
+        if (chunk.empty()) {
+            break;
+        }
+        total += chunk.size();
+        if (total > max_size) {
+            co_return std::nullopt;
+        }
+        chunks.push_back(std::move(chunk));
+    }
+    ss::sstring body(ss::sstring::initialized_later{}, total);
+    char* p = body.data();
+    for (const auto& chunk : chunks) {
+        p = std::copy_n(chunk.get(), chunk.size(), p);
+    }
+    co_return body;
+}
 
 std::vector<Key> merge_sorted(std::vector<std::vector<Key>> lists) {
     size_t total = 0;
@@ -115,13 +140,19 @@ ss::future<WebApi::reply_ptr> WebApi::put(request_ptr req, reply_ptr rep) {
     }
     const Key key(key_str);
 
-    ss::sstring body = co_await ss::util::read_entire_stream_contiguous(*req->content_stream);
-    if (!Value::is_valid(body)) {
+    std::optional<ss::sstring> body = co_await read_body(*req->content_stream, _max_value_size);
+    if (!body) {
+        rep->set_status(ss::http::reply::status_type::payload_too_large);
+        rep->write_body("json", ss::sstring(fmt::format(R"({{"error":"value is larger than {} bytes"}})",
+                _max_value_size)));
+        co_return std::move(rep);
+    }
+    if (!Value::is_valid(*body)) {
         rep->set_status(ss::http::reply::status_type::bad_request);
         rep->write_body("json", ss::sstring(R"({"error":"value must be valid UTF-8"})"));
         co_return std::move(rep);
     }
-    Value value(std::move(body));
+    Value value(std::move(*body));
 
     bool created = co_await container().invoke_on(owner(key),
             [&key, value = std::move(value)](WebApi& api) mutable {

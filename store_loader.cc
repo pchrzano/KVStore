@@ -117,15 +117,14 @@ std::optional<uint64_t> StoreLoader::data_file_generation(std::string_view name)
     return parse_uint(name.substr(0, dash));
 }
 
-ss::future<> StoreLoader::remove_other_generations(uint64_t keep, bool replaced) {
-    std::vector<ss::sstring> stale;
+ss::future<std::vector<ss::sstring>> StoreLoader::list_data_files() {
+    std::vector<ss::sstring> files;
     ss::file dir = co_await ss::open_directory(".");
     std::exception_ptr ex;
     try {
-        auto lister = dir.list_directory([&stale, keep](ss::directory_entry de) {
-            auto gen = data_file_generation(de.name);
-            if (gen && *gen != keep) {
-                stale.push_back(de.name);
+        auto lister = dir.list_directory([&files](ss::directory_entry de) {
+            if (data_file_generation(de.name)) {
+                files.push_back(de.name);
             }
             return ss::make_ready_future<>();
         });
@@ -137,6 +136,13 @@ ss::future<> StoreLoader::remove_other_generations(uint64_t keep, bool replaced)
     if (ex) {
         std::rethrow_exception(ex);
     }
+    std::ranges::sort(files);
+    co_return files;
+}
+
+ss::future<> StoreLoader::remove_other_generations(uint64_t keep, bool replaced) {
+    std::vector<ss::sstring> stale = co_await list_data_files();
+    std::erase_if(stale, [keep](const ss::sstring& name) { return data_file_generation(name) == keep; });
     for (const auto& name : stale) {
         if (replaced) {
             loaderlog.info("removing {}: replaced by generation {}", name, keep);
@@ -242,10 +248,17 @@ ss::future<> StoreLoader::load_or_reshard() {
     try {
         std::optional<Meta> meta = co_await read_meta();
         if (!meta) {
+            _stage = "checking the data directory";
+            const std::vector<ss::sstring> files = co_await list_data_files();
+            if (!files.empty()) {
+                throw std::runtime_error(ss::format(
+                        "kv.meta is missing but {} data files exist ({}{}); restore kv.meta, or move the data "
+                        "files away to start with an empty store",
+                        files.size(), files.front(), files.size() > 1 ? ", ..." : ""));
+            }
             loaderlog.info("no kv.meta: new data directory, {} shards, generation 1", count);
             _stage = "creating a new data directory";
             co_await write_meta({count, 1});
-            co_await remove_other_generations(1, false);
             co_await _api.invoke_on_all([](WebApi& a) { a.store().start_generation(1); });
             co_return;
         }

@@ -35,7 +35,8 @@ Replaying a file from start to end gives the current state: the last record for 
 
 Before serving, the server rebuilds its index from the data files ([`store_loader.hh`](store_loader.hh)):
 
-- **No `kv.meta`:** a new data directory (generation 1).
+- **No `kv.meta`:** a new data directory (generation 1). If data files exist without `kv.meta`
+  (e.g. it was deleted), the server refuses to start instead of guessing, so no data is lost.
 - **Same shard count:** every shard replays its own file. An incomplete record at the end (a crash
   during an append) is truncated away.
 - **Different `--smp`:** the data is resharded. Each old file is replayed (every key lives in exactly
@@ -49,7 +50,12 @@ Before serving, the server rebuilds its index from the data files ([`store_loade
 
 - Keys: valid UTF-8, 1–255 bytes. In the URL a key is percent-encoded, so a key containing `/` is
   written as `%2F` (e.g. `/api/v1/kv/a%2Fb` is the key `a/b`); a raw `/` gives 404. Values: valid
-  UTF-8, any length.
+  UTF-8, up to `--max-value-size` bytes (default 1 MiB); a larger PUT gets `413`. Values are kept in
+  memory whole (in the cache, and several copies during a GET), so a full cache of maximum-size values
+  plus a GET needs about `(cache-size + 8) × max-value-size` bytes per shard. If that is more than
+  half of the memory per shard (`--memory` / `--smp`), the server refuses to start and prints which
+  `--max-value-size`, `--cache-size` or memory would fit; e.g. the defaults (1 MiB values, cache of
+  100) need at least 216 MiB per shard.
 - Files are only compacted by resharding; otherwise old versions and tombstones stay.
 - Records have no checksum, so a torn write whose bytes happen to look like a valid record would
   not be detected.
@@ -59,7 +65,7 @@ Before serving, the server rebuilds its index from the data files ([`store_loade
 
 | Method | Path | Body | Responses |
 |---|---|---|---|
-| `PUT` | `/api/v1/kv/{key}` | the value (raw UTF-8) | `201` created, `200` updated, `400` invalid key or value |
+| `PUT` | `/api/v1/kv/{key}` | the value (raw UTF-8) | `201` created, `200` updated, `400` invalid key or value, `413` value larger than `--max-value-size` |
 | `GET` | `/api/v1/kv/{key}` | — | `200` `{"key":…,"value":…}`, `404`, `400` |
 | `DELETE` | `/api/v1/kv/{key}` | — | `204` deleted, `404`, `400` |
 | `GET` | `/api/v1/kv` | — | `200` `{"keys":[…]}` — all keys, sorted by bytes |
@@ -130,6 +136,7 @@ ninja -C build/release
 | `--smp` | all cores | number of shards (Seastar) |
 | `--memory` | most of RAM | memory for the app (Seastar) |
 | `--cache-size` | `100` | key-value pairs cached per shard; `0` disables the cache |
+| `--max-value-size` | `1048576` (1 MiB) | largest value in bytes; larger PUTs get `413`. With `--cache-size` it must fit the memory per shard (see [Limits](#limits)) |
 | `--unsafe-bypass-fsync 1` | off | skip `fdatasync` — faster, may lose data; for testing only |
 | `--logger-log-level <logger>=<level>` | `info` | log level per logger, e.g. `kv-store=debug:kv-http=debug` (see [Logging](#logging)) |
 
@@ -201,3 +208,18 @@ To see which shard a stopped thread belongs to, in gdb:
 | `log.hh` | the loggers (`kvapp`, `kv-loader`, `kv-store`, `kv-http`) |
 | `tests/` | HTTP tests: `run_tests.sh`, `read_update_test.py` |
 | `openapi.yaml` | API specification |
+
+## Improvements with more time
+
+- **Record checksums.** A CRC per record, checked on replay and on read, so torn or corrupted
+  records are always detected.
+- **Compaction.** Rewrite each shard's live records into a new file in the background, dropping old
+  versions and tombstones. This also limits how long a reshard takes, since there is less to copy.
+- **Group commit.** Batch all writes that arrive while an fsync is in progress into the next fsync,
+  instead of one fsync per write.
+- **Pagination for listing** (e.g. `?start_after=<key>&limit=<n>`), so listing does not return every
+  key in one response.
+- **Keep data files open** instead of opening and closing a file on every request.
+- **Metrics** through Seastar's metrics API, with a Prometheus endpoint.
+- **C++ unit tests** with the Seastar test framework (`SEASTAR_TEST_CASE`).
+- **Replication** across nodes.

@@ -15,7 +15,8 @@
 
 class WebApi : public seastar::peering_sharded_service<WebApi> {
 public:
-    explicit WebApi(std::size_t cache_capacity) : _store(cache_capacity) {}
+    WebApi(std::size_t cache_capacity, std::size_t max_value_size)
+        : _store(cache_capacity), _max_value_size(max_value_size) {}
 
     void register_routes(seastar::httpd::routes& r);
 
@@ -44,4 +45,5 @@ private:
     static std::string json_escape(std::string_view in);
 
     Store _store;
+    std::size_t _max_value_size;
 };

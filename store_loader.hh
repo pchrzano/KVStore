@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 class WebApi;
 
@@ -35,6 +36,7 @@ private:
             unsigned new_count);
     static seastar::future<std::optional<Meta>> read_meta();
     static seastar::future<> write_meta(Meta m);
+    static seastar::future<std::vector<seastar::sstring>> list_data_files();
     static seastar::future<> remove_other_generations(uint64_t keep, bool replaced);
     static std::optional<uint64_t> data_file_generation(std::string_view name);
     static std::optional<uint64_t> parse_uint(std::string_view s);
