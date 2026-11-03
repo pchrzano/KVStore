@@ -219,6 +219,7 @@ To see which shard a stopped thread belongs to, in gdb:
   instead of one fsync per write.
 - **Pagination for listing** (e.g. `?start_after=<key>&limit=<n>`), so listing does not return every
   key in one response.
+- **Yield in long loops** with `co_await seastar::coroutine::maybe_yield()`.
 - **Keep data files open** instead of opening and closing a file on every request.
 - **Metrics** through Seastar's metrics API, with a Prometheus endpoint.
 - **C++ unit tests** with the Seastar test framework (`SEASTAR_TEST_CASE`).
