@@ -11,6 +11,8 @@ Uses only the Python standard library. Exits with status 1 on any failure.
     tests/read_update_test.py --keys 150 --url http://localhost:18080 --iterations 100
 """
 
+from __future__ import annotations
+
 import argparse
 import http.client
 import json
@@ -18,11 +20,8 @@ import sys
 import time
 import urllib.parse
 
-
 def make_value(key_index: int, iteration: int) -> str:
-    # Non-ASCII text, to exercise UTF-8 handling.
     return f"wartość-{key_index}-iteracja-{iteration}"
-
 
 class Client:
     def __init__(self, url: str):
@@ -35,7 +34,6 @@ class Client:
         self.conn.request(method, path, body=data)
         resp = self.conn.getresponse()
         return resp.status, resp.read()
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -55,7 +53,6 @@ def main() -> int:
         failures += 1
         print(f"FAIL: {msg}", file=sys.stderr)
 
-    # Create (a key left over from an earlier run is updated instead: 200).
     start = time.perf_counter()
     for i, key in enumerate(keys):
         value = make_value(i, 0)
@@ -100,7 +97,6 @@ def main() -> int:
         return 1
     print("OK")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

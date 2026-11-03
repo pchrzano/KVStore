@@ -10,7 +10,6 @@ const Value* LRUCache::get(const Key& key) {
     if (found == _index.end()) {
         return nullptr;
     }
-    // Move the node to the front; iterators stay valid.
     _lru.splice(_lru.begin(), _lru, found->second);
     return &found->second->value;
 }

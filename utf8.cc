@@ -1,7 +1,6 @@
 #include "utf8.hh"
 
 namespace utf8 {
-
 bool is_valid(std::string_view s) noexcept {
     auto p = reinterpret_cast<const unsigned char*>(s.data());
     const auto end = p + s.size();
@@ -22,7 +21,7 @@ bool is_valid(std::string_view s) noexcept {
         } else if ((c & 0xF8) == 0xF0) {
             len = 4; cp = c & 0x07; min = 0x10000;
         } else {
-            return false; // stray continuation byte or 0xF8..0xFF
+            return false;
         }
         if (end - p < len) {
             return false;
@@ -41,4 +40,4 @@ bool is_valid(std::string_view s) noexcept {
     return true;
 }
 
-} // namespace utf8
+}

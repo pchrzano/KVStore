@@ -13,6 +13,7 @@
 #include <seastar/core/smp.hh>
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <stdexcept>
 #include <string_view>
@@ -20,8 +21,18 @@
 #include <utility>
 #include <vector>
 
+namespace {
+
+template <typename... Args>
+[[noreturn]] void corrupt(fmt::format_string<Args...> format, Args&&... args) {
+    std::string message = fmt::format(format, std::forward<Args>(args)...);
+    storelog.error("corrupt data: {}", message);
+    throw std::runtime_error(message);
+}
+
+}
+
 unsigned Store::owner(const Key& key, unsigned shard_count) {
-    // FNV-1a, then a murmur3 finalizer so the low bits mix well for `%`.
     uint64_t h = 14695981039346656037ull;
     for (unsigned char c : key.view()) {
         h = (h ^ c) * 1099511628211ull;
@@ -42,12 +53,9 @@ seastar::sstring Store::file_name() const {
     return file_name(_generation, seastar::this_shard_id());
 }
 
-// [type: u8][key size: u64][key][value size: u64]
 uint64_t Store::header_size(const Key& key) {
     return 1 + sizeof(uint64_t) + key.size() + sizeof(uint64_t);
 }
-
-// --- Startup ---------------------------------------------------------------
 
 void Store::start_generation(uint64_t generation) {
     _generation = generation;
@@ -55,11 +63,11 @@ void Store::start_generation(uint64_t generation) {
     _dir_synced = false;
 }
 
-seastar::future<> Store::load(uint64_t generation) {
+seastar::future<Store::LoadStats> Store::load(uint64_t generation) {
     start_generation(generation);
     const seastar::sstring path = file_name();
     if (!co_await seastar::file_exists(path)) {
-        co_return;
+        co_return LoadStats{};
     }
     ScanResult r = co_await scan(path);
 
@@ -67,14 +75,13 @@ seastar::future<> Store::load(uint64_t generation) {
     const unsigned count = seastar::this_smp_shard_count();
     for (const auto& [key, offset] : r.live) {
         if (owner(key, count) != shard) {
-            throw std::runtime_error(seastar::format(
-                    "{}: key {} at offset {} belongs to shard {}, not {}",
-                    path, key, offset, owner(key, count), shard));
+            corrupt("{}: key {} at offset {} belongs to shard {}, not {}",
+                    path, key, offset, owner(key, count), shard);
         }
     }
 
     if (r.valid_end < r.file_size) {
-        kvlog.warn("{}: dropping {} bytes of incomplete or invalid data at offset {}",
+        storelog.warn("{}: dropping {} bytes of incomplete or invalid data at offset {}",
                 path, r.file_size - r.valid_end, r.valid_end);
         seastar::file f = co_await seastar::open_file_dma(path, seastar::open_flags::rw);
         std::exception_ptr ex;
@@ -91,7 +98,8 @@ seastar::future<> Store::load(uint64_t generation) {
     }
 
     _data = std::move(r.live);
-    kvlog.info("{}: loaded {} keys from {} records", path, _data.size(), r.records);
+    storelog.debug("{}: loaded {} keys from {} records", path, _data.size(), r.records);
+    co_return LoadStats{_data.size(), r.records, r.valid_end};
 }
 
 seastar::future<> Store::import(std::vector<std::pair<Key, Value>> records) {
@@ -111,7 +119,6 @@ seastar::future<Store::ScanResult> Store::scan(seastar::sstring path) {
     ScanResult r;
     seastar::file f = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
     r.file_size = co_await f.size();
-    // Sequential reads with read-ahead; closing the stream closes the file.
     auto in = seastar::make_file_input_stream(f, 0, r.file_size,
             seastar::file_input_stream_options{.buffer_size = 128 * 1024, .read_ahead = 4});
     std::exception_ptr ex;
@@ -139,9 +146,9 @@ seastar::future<Store::ScanResult> Store::scan(seastar::sstring path) {
             const uint64_t value_size = seastar::read_le<uint64_t>(size_buf.get());
             const uint64_t end = pos + 1 + 2 * sizeof(uint64_t) + key_size + value_size;
             if ((type == RecordType::del && value_size != 0) || end > r.file_size) {
-                break; // torn or corrupt
+                break;
             }
-            co_await in.skip(value_size); // the index only needs offsets
+            co_await in.skip(value_size);
 
             Key key(key_bytes);
             if (type == RecordType::put) {
@@ -166,20 +173,17 @@ seastar::future<Store::ScanResult> Store::scan(seastar::sstring path) {
 seastar::future<Value> Store::read_value(seastar::file& f, const seastar::sstring& path,
         uint64_t offset, const Key& key) {
     const uint64_t header_len = header_size(key);
-    // Returns at least the header, and data up to the next block boundary,
-    // so a small value usually comes back in this same read.
     auto head = co_await f.dma_read_bulk<char>(offset, header_len);
     if (head.size() < header_len) {
-        throw std::runtime_error(seastar::format("{}: truncated record at {}", path, offset));
+        corrupt("{}: truncated record at {}", path, offset);
     }
     const char* p = head.get();
-    // The index only points at put records, so anything else means corruption.
     if (static_cast<RecordType>(p[0]) != RecordType::put) {
-        throw std::runtime_error(seastar::format("{}: record at {} is not a put", path, offset));
+        corrupt("{}: record at {} is not a put", path, offset);
     }
     if (seastar::read_le<uint64_t>(p + 1) != key.size()
             || std::string_view(p + 1 + sizeof(uint64_t), key.size()) != key.view()) {
-        throw std::runtime_error(seastar::format("{}: record at {} is not for key {}", path, offset, key));
+        corrupt("{}: record at {} is not for key {}", path, offset, key);
     }
     const uint64_t value_size = seastar::read_le<uint64_t>(p + 1 + sizeof(uint64_t) + key.size());
 
@@ -190,17 +194,18 @@ seastar::future<Value> Store::read_value(seastar::file& f, const seastar::sstrin
         auto rest = co_await f.dma_read_exactly<char>(offset + header_len + in_head, value_size - in_head);
         std::copy_n(rest.get(), rest.size(), value.data() + in_head);
     }
-    co_return Value(std::move(value)); // Value re-checks UTF-8, catching corrupt data
+    if (!Value::is_valid(value)) {
+        corrupt("{}: value of key {} at {} is not valid UTF-8", path, key, offset);
+    }
+    co_return Value(std::move(value));
 }
 
-// --- Operations --------------------------------------------------------------
-
 seastar::future<bool> Store::put(Key key, Value value) {
-    kvlog.info("Putting key: {}, value: {} at shard: {}", key, value, seastar::this_shard_id());
     auto units = co_await seastar::get_units(_append_lock, 1);
     std::vector<uint64_t> offsets = co_await append_records({{RecordType::put, &key, value.view()}});
     auto [it, inserted] = _data.insert_or_assign(key, offsets[0]);
-    _cache.put(key, std::move(value)); // only once it is on disk
+    storelog.debug("put key={} bytes={} offset={} created={}", key, value.size(), offsets[0], inserted);
+    _cache.put(key, std::move(value));
     co_return inserted;
 }
 
@@ -210,9 +215,11 @@ seastar::future<std::optional<Value>> Store::get(Key key) const {
         co_return std::nullopt;
     }
     if (const Value* cached = _cache.get(key)) {
+        storelog.debug("get key={}: cache hit", key);
         co_return *cached;
     }
     const uint64_t offset = it->second;
+    storelog.debug("get key={}: cache miss, reading offset {}", key, offset);
     const seastar::sstring path = file_name();
 
     seastar::file f = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
@@ -227,9 +234,6 @@ seastar::future<std::optional<Value>> Store::get(Key key) const {
     if (ex) {
         std::rethrow_exception(ex);
     }
-    // While we were reading, a put or delete may have changed the key. Only
-    // cache the value if it is still the latest one (a new put always gets
-    // a new offset).
     if (auto now = _data.find(key); now != _data.end() && now->second == offset) {
         _cache.put(key, *result);
     }
@@ -238,15 +242,15 @@ seastar::future<std::optional<Value>> Store::get(Key key) const {
 
 seastar::future<bool> Store::remove(Key key) {
     if (!_data.contains(key)) {
-        co_return false; // nothing to delete, no disk write
+        co_return false;
     }
     auto units = co_await seastar::get_units(_append_lock, 1);
-    // Re-check: another delete may have removed the key while we waited.
     if (!_data.contains(key)) {
         co_return false;
     }
-    co_await append_records({{RecordType::del, &key, {}}});
-    _data.erase(key); // only after the tombstone is written
+    std::vector<uint64_t> offsets = co_await append_records({{RecordType::del, &key, {}}});
+    _data.erase(key);
+    storelog.debug("delete key={} offset={}", key, offsets[0]);
     co_return true;
 }
 
@@ -259,21 +263,18 @@ std::vector<Key> Store::keys() const {
     return result;
 }
 
-// Seastar file I/O is DMA (O_DIRECT): writes must start at an aligned offset
-// and cover whole blocks. So one append is: read the file's last partial
-// block (if any), put the records after it, write everything from that
-// block's start in a single dma_write, truncate the padding off the end, and
-// fsync.
 seastar::future<std::vector<uint64_t>> Store::append_records(const std::vector<Record>& records) {
+    const auto started = std::chrono::steady_clock::now();
     const seastar::sstring path = file_name();
     seastar::file f = co_await seastar::open_file_dma(path,
             seastar::open_flags::rw | seastar::open_flags::create);
     std::exception_ptr ex;
     std::vector<uint64_t> offsets;
     offsets.reserve(records.size());
+    uint64_t records_len = 0;
+    double fsync_ms = 0;
     try {
         const uint64_t start = co_await f.size();
-        uint64_t records_len = 0;
         for (const auto& r : records) {
             offsets.push_back(start + records_len);
             records_len += header_size(*r.key) + r.value.size();
@@ -281,7 +282,7 @@ seastar::future<std::vector<uint64_t>> Store::append_records(const std::vector<R
 
         const uint64_t align = f.disk_write_dma_alignment();
         const uint64_t block_start = seastar::align_down(start, align);
-        const uint64_t tail = start - block_start; // bytes already in the last block
+        const uint64_t tail = start - block_start;
         const uint64_t buf_len = seastar::align_up(tail + records_len, align);
         auto buf = seastar::allocate_aligned_buffer<char>(buf_len,
                 std::max<uint64_t>(align, f.memory_dma_alignment()));
@@ -308,12 +309,10 @@ seastar::future<std::vector<uint64_t>> Store::append_records(const std::vector<R
             throw std::runtime_error(seastar::format("{}: short write", path));
         }
         co_await f.truncate(start + records_len);
-        // fdatasync: the records and the new file size are on stable storage
-        // before the caller reports success.
+        const auto fsync_started = std::chrono::steady_clock::now();
         co_await f.flush();
+        fsync_ms = elapsed_ms(fsync_started);
         if (!_dir_synced) {
-            // The file may have just been created; make its directory entry
-            // durable too. Once per shard per generation is enough.
             co_await seastar::sync_directory(".");
             _dir_synced = true;
         }
@@ -323,6 +322,11 @@ seastar::future<std::vector<uint64_t>> Store::append_records(const std::vector<R
     co_await f.close();
     if (ex) {
         std::rethrow_exception(ex);
+    }
+    const double total_ms = elapsed_ms(started);
+    if (total_ms >= std::chrono::duration<double, std::milli>(slow_append_threshold).count()) {
+        storelog.warn("slow append to {}: {:.0f} ms (fsync {:.0f} ms), {} records, {} bytes",
+                path, total_ms, fsync_ms, records.size(), records_len);
     }
     co_return offsets;
 }

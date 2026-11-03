@@ -1,4 +1,4 @@
-#include "recovery.hh"
+#include "store_loader.hh"
 
 #include "log.hh"
 #include "store.hh"
@@ -13,6 +13,10 @@
 #include <seastar/util/file.hh>
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
+#include <iterator>
+#include <string>
 #include <charconv>
 #include <exception>
 #include <optional>
@@ -25,20 +29,20 @@ namespace ss = seastar;
 
 namespace {
 
-constexpr char meta_file[] = "kv.meta";
-constexpr char meta_tmp_file[] = "kv.meta.tmp";
-constexpr unsigned format_version = 1;
+std::string format_bytes(uint64_t bytes) {
+    constexpr const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = static_cast<double>(bytes);
+    size_t u = 0;
+    while (v >= 1024 && u + 1 < std::size(units)) {
+        v /= 1024;
+        ++u;
+    }
+    return u == 0 ? fmt::format("{} B", bytes) : fmt::format("{:.1f} {}", v, units[u]);
+}
 
-// Resharding sends records to their new owner in batches of about this size.
-constexpr size_t batch_bytes = 1 << 20;
-constexpr size_t batch_records = 4096;
+}
 
-struct Meta {
-    unsigned shard_count;
-    uint64_t generation;
-};
-
-std::optional<uint64_t> parse_uint(std::string_view s) {
+std::optional<uint64_t> StoreLoader::parse_uint(std::string_view s) {
     uint64_t v;
     auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
     if (ec != std::errc{} || ptr != s.data() + s.size()) {
@@ -47,8 +51,7 @@ std::optional<uint64_t> parse_uint(std::string_view s) {
     return v;
 }
 
-// kv.meta is text, one `name=value` per line.
-ss::future<std::optional<Meta>> read_meta() {
+ss::future<std::optional<StoreLoader::Meta>> StoreLoader::read_meta() {
     if (!co_await ss::file_exists(meta_file)) {
         co_return std::nullopt;
     }
@@ -79,9 +82,7 @@ ss::future<std::optional<Meta>> read_meta() {
     co_return Meta{static_cast<unsigned>(*shards), *generation};
 }
 
-// Write to a temporary file, fsync, rename over kv.meta, fsync the directory:
-// a crash leaves either the old or the new kv.meta, never a partial one.
-ss::future<> write_meta(Meta m) {
+ss::future<> StoreLoader::write_meta(Meta m) {
     const ss::sstring text = ss::format("format={}\nshard_count={}\ngeneration={}\n",
             format_version, m.shard_count, m.generation);
     ss::file f = co_await ss::open_file_dma(meta_tmp_file,
@@ -90,11 +91,11 @@ ss::future<> write_meta(Meta m) {
     std::exception_ptr ex;
     try {
         co_await out.write(text);
-        co_await out.flush(); // includes fdatasync
+        co_await out.flush();
     } catch (...) {
         ex = std::current_exception();
     }
-    co_await out.close(); // closes the file
+    co_await out.close();
     if (ex) {
         std::rethrow_exception(ex);
     }
@@ -102,8 +103,7 @@ ss::future<> write_meta(Meta m) {
     co_await ss::sync_directory(".");
 }
 
-// Generation of a data file name "store-g<generation>-<shard>.dat".
-std::optional<uint64_t> data_file_generation(std::string_view name) {
+std::optional<uint64_t> StoreLoader::data_file_generation(std::string_view name) {
     constexpr std::string_view prefix = "store-g", suffix = ".dat";
     if (!name.starts_with(prefix) || !name.ends_with(suffix)) {
         return std::nullopt;
@@ -117,7 +117,7 @@ std::optional<uint64_t> data_file_generation(std::string_view name) {
     return parse_uint(name.substr(0, dash));
 }
 
-ss::future<> remove_other_generations(uint64_t keep) {
+ss::future<> StoreLoader::remove_other_generations(uint64_t keep, bool replaced) {
     std::vector<ss::sstring> stale;
     ss::file dir = co_await ss::open_directory(".");
     std::exception_ptr ex;
@@ -138,7 +138,12 @@ ss::future<> remove_other_generations(uint64_t keep) {
         std::rethrow_exception(ex);
     }
     for (const auto& name : stale) {
-        kvlog.info("removing {} (not generation {})", name, keep);
+        if (replaced) {
+            loaderlog.info("removing {}: replaced by generation {}", name, keep);
+        } else {
+            loaderlog.warn("removing {}: not part of generation {} (left over from an interrupted resharding)",
+                    name, keep);
+        }
         co_await ss::remove_file(name);
     }
     if (!stale.empty()) {
@@ -146,19 +151,16 @@ ss::future<> remove_other_generations(uint64_t keep) {
     }
 }
 
-// Runs on the shard that was assigned the old file: replays it and sends
-// every live record to its owner under the new shard count.
-ss::future<> migrate_file(ss::sharded<WebApi>& api, ss::sstring path, unsigned new_count) {
+ss::future<size_t> StoreLoader::migrate_file(ss::sharded<WebApi>& api, ss::sstring path, unsigned new_count) {
     if (!co_await ss::file_exists(path)) {
-        co_return; // that old shard never wrote anything
+        co_return 0;
     }
     Store::ScanResult scan = co_await Store::scan(path);
     if (scan.valid_end < scan.file_size) {
-        kvlog.warn("{}: ignoring {} bytes of incomplete or invalid data at offset {}",
+        loaderlog.warn("{}: ignoring {} bytes of incomplete or invalid data at offset {}",
                 path, scan.file_size - scan.valid_end, scan.valid_end);
     }
 
-    // Read the values in file order, so the reads go forward through the file.
     std::vector<std::pair<uint64_t, Key>> by_offset;
     by_offset.reserve(scan.live.size());
     for (auto& [key, offset] : scan.live) {
@@ -201,48 +203,72 @@ ss::future<> migrate_file(ss::sharded<WebApi>& api, ss::sstring path, unsigned n
     if (ex) {
         std::rethrow_exception(ex);
     }
-    kvlog.info("{}: moved {} keys", path, by_offset.size());
+    loaderlog.debug("{}: moved {} keys", path, by_offset.size());
+    co_return by_offset.size();
 }
 
-ss::future<> reshard(ss::sharded<WebApi>& api, Meta old, unsigned new_count) {
+ss::future<> StoreLoader::reshard(Meta old, unsigned new_count) {
+    const auto started = std::chrono::steady_clock::now();
     const uint64_t new_gen = old.generation + 1;
-    kvlog.info("resharding from {} to {} shards (generation {} -> {})",
-            old.shard_count, new_count, old.generation, new_gen);
+    _stage = ss::format("resharding {}→{} (generation {} → {}); kv.meta still at generation {}",
+            old.shard_count, new_count, old.generation, new_gen, old.generation);
 
-    co_await api.invoke_on_all([new_gen](WebApi& a) {
+    co_await _api.invoke_on_all([new_gen](WebApi& a) {
         a.store().start_generation(new_gen);
     });
-    // Old file i is migrated by new shard i % new_count, all shards in parallel.
-    co_await api.invoke_on_all([&api, old, new_count](WebApi&) -> ss::future<> {
-        for (unsigned i = ss::this_shard_id(); i < old.shard_count; i += new_count) {
-            co_await migrate_file(api, Store::file_name(old.generation, i), new_count);
-        }
-    });
+    const size_t moved = co_await _api.map_reduce0(
+            [&api = _api, old, new_count](WebApi&) -> ss::future<size_t> {
+                size_t n = 0;
+                for (unsigned i = ss::this_shard_id(); i < old.shard_count; i += new_count) {
+                    n += co_await migrate_file(api, Store::file_name(old.generation, i), new_count);
+                }
+                co_return n;
+            },
+            size_t{0}, std::plus<>{});
 
-    // Every record is now fsynced in the new generation: switch over.
     co_await write_meta({new_count, new_gen});
-    co_await remove_other_generations(new_gen);
+    loaderlog.info("kv.meta switched to generation {}, shard count {}", new_gen, new_count);
+
+    _stage = ss::format("removing generation {} files after resharding", old.generation);
+    co_await remove_other_generations(new_gen, true);
+    loaderlog.info("resharded {}→{}: {} keys moved in {:.0f} ms",
+            old.shard_count, new_count, moved, elapsed_ms(started));
 }
 
-} // namespace
-
-ss::future<> recover(ss::sharded<WebApi>& api) {
+ss::future<> StoreLoader::load_or_reshard() {
+    const auto started = std::chrono::steady_clock::now();
     const unsigned count = ss::this_smp_shard_count();
-    std::optional<Meta> meta = co_await read_meta();
-    if (!meta) {
-        kvlog.info("new data directory: {} shards, generation 1", count);
-        co_await write_meta({count, 1});
-        co_await remove_other_generations(1);
-        co_await api.invoke_on_all([](WebApi& a) { a.store().start_generation(1); });
-        co_return;
-    }
+    _stage = "reading kv.meta";
+    try {
+        std::optional<Meta> meta = co_await read_meta();
+        if (!meta) {
+            loaderlog.info("no kv.meta: new data directory, {} shards, generation 1", count);
+            _stage = "creating a new data directory";
+            co_await write_meta({count, 1});
+            co_await remove_other_generations(1, false);
+            co_await _api.invoke_on_all([](WebApi& a) { a.store().start_generation(1); });
+            co_return;
+        }
 
-    co_await remove_other_generations(meta->generation);
-    if (meta->shard_count == count) {
-        co_await api.invoke_on_all([gen = meta->generation](WebApi& a) {
-            return a.store().load(gen);
-        });
-    } else {
-        co_await reshard(api, *meta, count);
+        const bool same = meta->shard_count == count;
+        loaderlog.info("kv.meta: generation {}, {} shards; running with {} → {}",
+                meta->generation, meta->shard_count, count, same ? "loading" : "resharding");
+
+        _stage = ss::format("removing leftover files (kv.meta at generation {})", meta->generation);
+        co_await remove_other_generations(meta->generation, false);
+
+        if (same) {
+            _stage = ss::format("loading generation {}", meta->generation);
+            const Store::LoadStats stats = co_await _api.map_reduce0(
+                    [gen = meta->generation](WebApi& a) { return a.store().load(gen); },
+                    Store::LoadStats{}, std::plus<>{});
+            loaderlog.info("loaded {} keys ({} records, {}) in {:.0f} ms",
+                    stats.keys, stats.records, format_bytes(stats.bytes), elapsed_ms(started));
+        } else {
+            co_await reshard(*meta, count);
+        }
+    } catch (...) {
+        loaderlog.error("startup failed while {}: {}", _stage, ss::formattable(std::current_exception()));
+        throw;
     }
 }

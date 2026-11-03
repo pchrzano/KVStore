@@ -13,6 +13,6 @@ cmake-build-*/
 # Data files written by the app (store-<shard>.dat)
 *.dat
 
-# Data directory metadata (see recovery.hh)
+# Data directory metadata (see store_loader.hh)
 kv.meta
 kv.meta.tmp

@@ -101,7 +101,7 @@ paths:
                 error: key not found
 
     delete:
-      operationId: delete_key
+      operationId: remove
       summary: Delete a key
       description: Appends a delete record (tombstone) to the owner shard's data file and removes the key.
       responses:

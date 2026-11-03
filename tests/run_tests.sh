@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# Runs the read/update tests against a running kv-app.
-#
-#   tests/run_tests.sh [iterations] [url]
-#   tests/run_tests.sh 10 http://localhost:18080
-#
-# Test 1: 50 keys. Test 2: 150 keys (more than the default cache of 100
-# pairs per shard when running with --smp 1, so some reads go to disk).
 set -u
 
 ITERATIONS=${1:-10}
@@ -21,7 +14,6 @@ run() {
     fi
 }
 
-# Different prefixes so the two tests don't share keys.
 run "test 1: 50 keys"  --keys 50  --prefix read-update-50-
 run "test 2: 150 keys" --keys 150 --prefix read-update-150-
 

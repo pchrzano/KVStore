@@ -33,7 +33,7 @@ Replaying a file from start to end gives the current state: the last record for 
 
 ### Startup and resharding
 
-Before serving, the server rebuilds its index from the data files ([`recovery.hh`](recovery.hh)):
+Before serving, the server rebuilds its index from the data files ([`store_loader.hh`](store_loader.hh)):
 
 - **No `kv.meta`:** a new data directory (generation 1).
 - **Same shard count:** every shard replays its own file. An incomplete record at the end (a crash
@@ -131,7 +131,46 @@ ninja -C build/release
 | `--memory` | most of RAM | memory for the app (Seastar) |
 | `--cache-size` | `100` | key-value pairs cached per shard; `0` disables the cache |
 | `--unsafe-bypass-fsync 1` | off | skip `fdatasync` — faster, may lose data; for testing only |
-| `--logger-log-level kvapp=warn` | `info` | silence the per-request "Putting…" log |
+| `--logger-log-level <logger>=<level>` | `info` | log level per logger, e.g. `kv-store=debug:kv-http=debug` (see [Logging](#logging)) |
+
+## Logging
+
+Each part of the app has its own logger, so its level can be set on its own
+(`--logger-log-level kv-store=debug:kv-http=debug`; separate loggers with `:`).
+
+| Logger | `info` / `warn` / `error` | `debug` |
+|---|---|---|
+| `kvapp` | start (options), fsync bypass warning, listening, stopping, stopped | — |
+| `kv-loader` | what startup does (new directory, load or reshard), summary with key count and time, `kv.meta` switch, removed files, startup failure with what it was doing | each migrated file |
+| `kv-store` | cut-off broken file tail, slow appends (≥ 100 ms, with the fsync time), corrupt data | every put, get (cache hit or miss) and delete, per-shard load |
+| `kv-http` | every request that failed with 500, with the error | access log: method, path, status, time, receiving and owner shard |
+
+At the default level (`info`) nothing is logged per request. Values are never logged, only their size.
+
+## Running the tests
+
+The tests talk to a running server over HTTP and need only Python 3.9+ (standard library).
+Start the server (e.g. `scripts/docker-run.sh`), then from the host:
+
+```bash
+tests/run_tests.sh                                # 10 iterations against http://localhost:18080
+tests/run_tests.sh 20 http://localhost:19000      # iterations, server URL
+```
+
+`run_tests.sh` runs two tests, each one creating its keys and then, every iteration, reading all of
+them (checking each value is the latest one written) and updating all of them:
+
+| Test | Keys |
+|---|---|
+| 1 | 50 |
+| 2 | 150 — more than the default cache of 100 pairs per shard with `--smp 1`, so reads go to disk |
+
+Each prints its read and update times and exits with status 1 on any wrong value or status code.
+To run one test with your own settings:
+
+```bash
+tests/read_update_test.py --keys 150 --iterations 20 --url http://localhost:18080
+```
 
 ## Debugging in CLion
 
@@ -154,10 +193,11 @@ To see which shard a stopped thread belongs to, in gdb:
 | `main.cc` | startup: options, `sharded<WebApi>`, HTTP server, signal handling |
 | `webapi.hh/.cc` | REST handlers, routing to owner shards, Swagger UI |
 | `store.hh/.cc` | per-shard store: index, file format, DMA append and read, replay |
-| `recovery.hh/.cc` | startup: `kv.meta`, loading, resharding, cleanup of old generations |
+| `store_loader.hh/.cc` | startup: `kv.meta`, loading, resharding, cleanup of old generations |
 | `lru_cache.hh/.cc` | `LRUCache`: least recently used cache of a fixed number of key-value pairs |
 | `key.hh/.cc` | `Key`: UTF-8 string up to 255 bytes, stored inline |
 | `value.hh/.cc` | `Value`: UTF-8 string of any length |
 | `utf8.hh/.cc` | UTF-8 validation |
-| `log.hh` | the `kvapp` logger |
+| `log.hh` | the loggers (`kvapp`, `kv-loader`, `kv-store`, `kv-http`) |
+| `tests/` | HTTP tests: `run_tests.sh`, `read_update_test.py` |
 | `openapi.yaml` | API specification |

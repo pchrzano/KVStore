@@ -7,14 +7,10 @@
 #include <functional>
 #include <string_view>
 
-// A value: a valid UTF-8 string of any length. The bytes live in an sstring
-// (stored inline up to 15 bytes, on the heap beyond that).
 class Value {
 public:
-    // Throws std::invalid_argument if `s` is not valid UTF-8.
     explicit Value(seastar::sstring s);
 
-    // True if `s` would make a valid Value.
     static bool is_valid(std::string_view s) noexcept;
 
     std::string_view view() const noexcept { return {_data.data(), _data.size()}; }
@@ -23,7 +19,6 @@ public:
     std::size_t size() const noexcept { return _data.size(); }
     bool empty() const noexcept { return _data.empty(); }
 
-    // Byte-wise ordering, which for UTF-8 equals code point ordering.
     friend bool operator==(const Value& a, const Value& b) noexcept { return a.view() == b.view(); }
     friend std::strong_ordering operator<=>(const Value& a, const Value& b) noexcept {
         return a.view() <=> b.view();

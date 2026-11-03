@@ -1,5 +1,5 @@
 #include "log.hh"
-#include "recovery.hh"
+#include "store_loader.hh"
 #include "webapi.hh"
 
 #include <seastar/core/app-template.hh>
@@ -11,6 +11,7 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/util/defer.hh>
 
+#include <chrono>
 #include <csignal>
 
 namespace ss = seastar;
@@ -33,7 +34,6 @@ public:
         ss::handle_signal(SIGTERM, [this] { signaled(); });
     }
     ~stop_signal() {
-        // Handlers can't be unregistered; replace them with no-ops.
         ss::handle_signal(SIGINT, [] {});
         ss::handle_signal(SIGTERM, [] {});
     }
@@ -50,40 +50,44 @@ int main(int argc, char** argv) {
 
     return app.run(argc, argv, [&app] {
         return ss::async([&app] {
+            const auto started = std::chrono::steady_clock::now();
             stop_signal stop;
             const auto& cfg = app.configuration();
             const auto address = cfg["address"].as<ss::sstring>();
             const auto port = cfg["port"].as<uint16_t>();
             const auto cache_size = cfg["cache-size"].as<size_t>();
 
-            // Every shard's WebApi is constructed with cache_size.
+            kvlog.info("starting: smp={} address={} port={} cache_size={}",
+                    ss::this_smp_shard_count(), address, port, cache_size);
+            if (cfg.count("unsafe-bypass-fsync") && cfg["unsafe-bypass-fsync"].as<bool>()) {
+                kvlog.warn("fsync is bypassed (--unsafe-bypass-fsync), data may be lost on crash");
+            }
+
             ss::sharded<WebApi> api;
             api.start(cache_size).get();
-            kvlog.info("cache: {} key-value pairs per shard", cache_size);
             auto stop_api = ss::defer([&api]() noexcept { api.stop().get(); });
 
-            // Load (or reshard) the data files before serving anything.
-            recover(api).get();
+            StoreLoader(api).load_or_reshard().get();
 
-            // http_server_control runs one HTTP server instance per shard.
             ss::httpd::http_server_control server;
             server.start("kv").get();
             auto stop_server = ss::defer([&server]() noexcept { server.stop().get(); });
 
-            // Hand request bodies to handlers as req->content_stream instead of
-            // pre-reading them into the deprecated req->content.
             server.server().invoke_on_all([](ss::httpd::http_server& s) {
                 s.set_content_streaming(true);
             }).get();
 
-            // set_routes runs this on every shard; local() is that shard's WebApi.
             server.set_routes([&api](ss::httpd::routes& r) { api.local().register_routes(r); }).get();
 
             server.listen(ss::socket_address{ss::net::inet_address{address}, port}).get();
-            kvlog.info("KVApp started");
+            kvlog.info("listening on {}:{} (startup took {:.0f} ms)", address, port, elapsed_ms(started));
 
             stop.wait().get();
+            kvlog.info("stopping");
             return 0;
+        }).then([](int code) {
+            kvlog.info("stopped");
+            return code;
         });
     });
 }

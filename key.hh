@@ -9,17 +9,12 @@
 #include <functional>
 #include <string_view>
 
-// A key: a valid UTF-8 string of at most 255 bytes, stored inline in a
-// fixed 255-byte buffer (no heap allocation). sizeof(Key) == 256.
 class Key {
 public:
     static constexpr std::size_t max_size = 255;
 
-    // Throws std::invalid_argument if `s` is longer than max_size bytes
-    // or is not valid UTF-8.
     explicit Key(std::string_view s);
 
-    // True if `s` would make a valid Key.
     static bool is_valid(std::string_view s) noexcept;
 
     std::string_view view() const noexcept { return {_data.data(), _size}; }
@@ -27,7 +22,6 @@ public:
     std::size_t size() const noexcept { return _size; }
     bool empty() const noexcept { return _size == 0; }
 
-    // Byte-wise ordering, which for UTF-8 equals code point ordering.
     friend bool operator==(const Key& a, const Key& b) noexcept { return a.view() == b.view(); }
     friend std::strong_ordering operator<=>(const Key& a, const Key& b) noexcept {
         return a.view() <=> b.view();

@@ -1,5 +1,7 @@
 #include "webapi.hh"
 
+#include "log.hh"
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/http/function_handlers.hh>
@@ -8,6 +10,8 @@
 
 #include "openapi_spec.hh"
 
+#include <chrono>
+#include <exception>
 #include <functional>
 #include <queue>
 #include <string>
@@ -18,8 +22,6 @@ namespace ss = seastar;
 using ss::httpd::operation_type;
 
 namespace {
-
-// Swagger UI, loaded from a CDN, pointed at the embedded spec.
 constexpr char swagger_ui_html[] = R"html(<!doctype html>
 <html lang="en">
 <head>
@@ -40,7 +42,6 @@ constexpr char swagger_ui_html[] = R"html(<!doctype html>
 </html>
 )html";
 
-// Serves a fixed body with a fixed Content-Type.
 class static_content_handler : public ss::httpd::handler_base {
     ss::sstring _content;
     ss::sstring _mime_type;
@@ -51,14 +52,11 @@ public:
 
     ss::future<std::unique_ptr<ss::http::reply>> handle(const ss::sstring&,
             std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply> rep) override {
-        // A value containing "/" is used as the Content-Type as-is.
         rep->write_body(std::string_view(_mime_type), _content);
         return ss::make_ready_future<std::unique_ptr<ss::http::reply>>(std::move(rep));
     }
 };
 
-// k-way merge of sorted lists into one sorted list: O(n log k).
-// Keys are moved out of `lists`. A key lives on one shard, so no duplicates.
 std::vector<Key> merge_sorted(std::vector<std::vector<Key>> lists) {
     size_t total = 0;
     for (const auto& l : lists) {
@@ -67,7 +65,6 @@ std::vector<Key> merge_sorted(std::vector<std::vector<Key>> lists) {
     std::vector<Key> out;
     out.reserve(total);
 
-    // Min-heap of (list, index) cursors, ordered by the key they point at.
     using cursor = std::pair<size_t, size_t>;
     auto greater = [&lists](const cursor& a, const cursor& b) {
         return lists[a.first][a.second] > lists[b.first][b.second];
@@ -89,12 +86,9 @@ std::vector<Key> merge_sorted(std::vector<std::vector<Key>> lists) {
     return out;
 }
 
-} // namespace
+}
 
 void WebApi::register_routes(ss::httpd::routes& r) {
-    // routes takes ownership of the rules and handlers.
-
-    // /api/v1/kv/{key}
     auto key_route = [&](operation_type op, endpoint fn) {
         auto* rule = new ss::httpd::match_rule(make_handler(fn));
         rule->add_str("/api/v1/kv").add_param("key");
@@ -102,12 +96,10 @@ void WebApi::register_routes(ss::httpd::routes& r) {
     };
     key_route(operation_type::PUT, &WebApi::put);
     key_route(operation_type::GET, &WebApi::get);
-    key_route(operation_type::DELETE, &WebApi::delete_key);
+    key_route(operation_type::DELETE, &WebApi::remove);
 
-    // /api/v1/kv (exact path)
     r.add(operation_type::GET, ss::httpd::url("/api/v1/kv"), make_handler(&WebApi::list_keys));
 
-    // API documentation: the OpenAPI spec and a Swagger UI page.
     r.add(operation_type::GET, ss::httpd::url("/api/v1/openapi.yaml"),
             new static_content_handler(openapi_spec, "application/yaml"));
     r.add(operation_type::GET, ss::httpd::url("/docs"),
@@ -123,7 +115,6 @@ ss::future<WebApi::reply_ptr> WebApi::put(request_ptr req, reply_ptr rep) {
     }
     const Key key(key_str);
 
-    // The whole body is the value. Needs content streaming enabled (see main).
     ss::sstring body = co_await ss::util::read_entire_stream_contiguous(*req->content_stream);
     if (!Value::is_valid(body)) {
         rep->set_status(ss::http::reply::status_type::bad_request);
@@ -132,7 +123,6 @@ ss::future<WebApi::reply_ptr> WebApi::put(request_ptr req, reply_ptr rep) {
     }
     Value value(std::move(body));
 
-    // Runs on the shard that owns the key, against that shard's Store.
     bool created = co_await container().invoke_on(owner(key),
             [&key, value = std::move(value)](WebApi& api) mutable {
                 return api._store.put(key, std::move(value));
@@ -154,7 +144,6 @@ ss::future<WebApi::reply_ptr> WebApi::get(request_ptr req, reply_ptr rep) {
     }
     const Key key(key_str);
 
-    // Same owner() as put, so this reaches the shard that stored the key.
     std::optional<Value> value = co_await container().invoke_on(owner(key),
             [&key](WebApi& api) {
                 return api._store.get(key);
@@ -171,7 +160,6 @@ ss::future<WebApi::reply_ptr> WebApi::get(request_ptr req, reply_ptr rep) {
 }
 
 ss::future<WebApi::reply_ptr> WebApi::list_keys(request_ptr req, reply_ptr rep) {
-    // Every shard returns its keys, already sorted (Store keeps a std::map).
     std::vector<std::vector<Key>> per_shard = co_await container().map([](WebApi& api) {
         return api._store.keys();
     });
@@ -191,7 +179,7 @@ ss::future<WebApi::reply_ptr> WebApi::list_keys(request_ptr req, reply_ptr rep) 
     co_return std::move(rep);
 }
 
-ss::future<WebApi::reply_ptr> WebApi::delete_key(request_ptr req, reply_ptr rep) {
+ss::future<WebApi::reply_ptr> WebApi::remove(request_ptr req, reply_ptr rep) {
     ss::sstring key_str = req->get_path_param("key");
     if (!Key::is_valid(key_str)) {
         rep->set_status(ss::http::reply::status_type::bad_request);
@@ -215,10 +203,37 @@ ss::future<WebApi::reply_ptr> WebApi::delete_key(request_ptr req, reply_ptr rep)
 }
 
 ss::httpd::handler_base* WebApi::make_handler(endpoint fn) {
-    // function_handler sets Content-Type: application/json on the reply.
     return new ss::httpd::function_handler(
-            [this, fn](request_ptr req, reply_ptr rep) { return (this->*fn)(std::move(req), std::move(rep)); },
+            [this, fn](request_ptr req, reply_ptr rep) { return handle(fn, std::move(req), std::move(rep)); },
             "json");
+}
+
+ss::future<WebApi::reply_ptr> WebApi::handle(endpoint fn, request_ptr req, reply_ptr rep) {
+    const auto started = std::chrono::steady_clock::now();
+    const ss::sstring method = req->_method;
+    const ss::sstring url = req->_url;
+    std::string route = fmt::format("shard {}", ss::this_shard_id());
+    if (req->param.exists("key")) {
+        const ss::sstring key = req->get_path_param("key");
+        if (Key::is_valid(key)) {
+            route += fmt::format(" → owner {}", owner(Key(key)));
+        }
+    }
+    std::exception_ptr ex;
+    try {
+        ss::future<reply_ptr> result = (this->*fn)(std::move(req), std::move(rep));
+        rep = co_await std::move(result);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    if (ex) {
+        httplog.error("{} {} → 500 in {:.1f} ms ({}): {}", method, url, elapsed_ms(started), route,
+                ss::formattable(ex));
+        std::rethrow_exception(ex);
+    }
+    httplog.debug("{} {} → {} in {:.1f} ms ({})", method, url, static_cast<int>(rep->_status),
+            elapsed_ms(started), route);
+    co_return std::move(rep);
 }
 
 unsigned WebApi::owner(const Key& key) {
