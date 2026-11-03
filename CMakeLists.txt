@@ -13,6 +13,7 @@ add_executable(kv-app
     main.cc
     webapi.cc
     store.cc
+    recovery.cc
     key.cc
     value.cc
     utf8.cc)

@@ -19,6 +19,9 @@ class WebApi : public seastar::peering_sharded_service<WebApi> {
 public:
     void register_routes(seastar::httpd::routes& r);
 
+    // This shard's Store (used at startup by recover()).
+    Store& store() noexcept { return _store; }
+
     // Required by seastar::sharded<>.
     seastar::future<> stop() { return _store.stop(); }
 

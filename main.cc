@@ -1,4 +1,5 @@
 #include "log.hh"
+#include "recovery.hh"
 #include "webapi.hh"
 
 #include <seastar/core/app-template.hh>
@@ -55,6 +56,9 @@ int main(int argc, char** argv) {
             ss::sharded<WebApi> api;
             api.start().get();
             auto stop_api = ss::defer([&api]() noexcept { api.stop().get(); });
+
+            // Load (or reshard) the data files before serving anything.
+            recover(api).get();
 
             // http_server_control runs one HTTP server instance per shard.
             ss::httpd::http_server_control server;

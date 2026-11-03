@@ -7,11 +7,13 @@ the framework behind ScyllaDB. It exposes a REST API and persists data to per-sh
 
 - **Shards.** Seastar runs one reactor thread per CPU core (a *shard*). Every shard runs its own HTTP
   server and owns its own `Store`; shards share nothing and communicate only by message passing.
-- **Key ownership.** A key belongs to shard `std::hash(key) % shard_count`. Whichever shard receives a
+- **Key ownership.** A key belongs to shard `hash(key) % shard_count`, using a stable hash
+  (FNV-1a), since the data files depend on it. Whichever shard receives a
   request forwards the work to the owner with `invoke_on`, so each `Store` is only ever touched by its
   own thread — no locks.
-- **Storage.** Each shard appends records to `store-<shard>.dat` in the working directory and keeps an
-  in-memory index `std::map<Key, offset>` pointing at each key's latest record. Reads go to the file.
+- **Storage.** Each shard appends records to `store-g<generation>-<shard>.dat` in the working
+  directory and keeps an in-memory index `std::map<Key, offset>` pointing at each key's latest
+  record. Reads go to the file. `kv.meta` records the format version, shard count and generation.
 - **Durability.** Appends are serialized per shard, written with aligned DMA (`O_DIRECT`) writes and
   `fdatasync`ed before the request is answered.
 - **Listing.** `GET /api/v1/kv` collects each shard's (already sorted) keys and k-way merges them.
@@ -27,12 +29,27 @@ type: 1 = put, 2 = delete (tombstone; value size 0, no value bytes)
 
 Replaying a file from start to end gives the current state: the last record for a key wins.
 
+### Startup and resharding
+
+Before serving, the server rebuilds its index from the data files ([`recovery.hh`](recovery.hh)):
+
+- **No `kv.meta`:** a new data directory (generation 1).
+- **Same shard count:** every shard replays its own file. An incomplete record at the end (a crash
+  during an append) is truncated away.
+- **Different `--smp`:** the data is resharded. Each old file is replayed (every key lives in exactly
+  one) and its live records are sent to their new owner shards, which write them to the next
+  generation. Then `kv.meta` is atomically switched and the old files deleted. Files of any other
+  generation are leftovers of an interrupted resharding and are deleted at startup, so a crash at
+  any point leaves either the old or the new generation complete. Resharding also drops old
+  versions and tombstones.
+
 ### Limits
 
 - Keys: valid UTF-8, 0–255 bytes, no `/`. Values: valid UTF-8, any length.
-- The index is in memory only: it is **not rebuilt from the files on restart** yet, so a restarted
-  server starts empty. The files are never compacted (old versions and tombstones stay).
-- The shard count (`--smp`) is fixed for the life of the process.
+- Files are only compacted by resharding; otherwise old versions and tombstones stay.
+- Records have no checksum, so a torn write whose bytes happen to look like a valid record would
+  not be detected.
+- The shard count (`--smp`) is fixed while the process runs; changing it between runs reshards.
 
 ## API
 
@@ -131,7 +148,8 @@ To see which shard a stopped thread belongs to, in gdb:
 |---|---|
 | `main.cc` | startup: options, `sharded<WebApi>`, HTTP server, signal handling |
 | `webapi.hh/.cc` | REST handlers, routing to owner shards, Swagger UI |
-| `store.hh/.cc` | per-shard store: index, file format, DMA append and read |
+| `store.hh/.cc` | per-shard store: index, file format, DMA append and read, replay |
+| `recovery.hh/.cc` | startup: `kv.meta`, loading, resharding, cleanup of old generations |
 | `key.hh/.cc` | `Key`: UTF-8 string up to 255 bytes, stored inline |
 | `value.hh/.cc` | `Value`: UTF-8 string of any length |
 | `utf8.hh/.cc` | UTF-8 validation |

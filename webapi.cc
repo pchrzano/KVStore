@@ -222,7 +222,7 @@ ss::httpd::handler_base* WebApi::make_handler(endpoint fn) {
 }
 
 unsigned WebApi::owner(const Key& key) {
-    return std::hash<Key>{}(key) % ss::this_smp_shard_count();
+    return Store::owner(key, ss::this_smp_shard_count());
 }
 
 std::string WebApi::json_escape(std::string_view in) {
