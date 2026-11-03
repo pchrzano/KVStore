@@ -224,3 +224,15 @@ To see which shard a stopped thread belongs to, in gdb:
 - **Metrics** through Seastar's metrics API, with a Prometheus endpoint.
 - **C++ unit tests** with the Seastar test framework (`SEASTAR_TEST_CASE`).
 - **Replication** across nodes.
+
+## AI usage
+
+I used **Claude Code** (Claude Opus) as a pair programmer throughout the project:
+
+- **Code:** most of it was written by Claude from my instructions. I chose the design and the trade-offs
+  (append-only files per shard, `kv.meta` generations for resharding, a count-limited cache, value size
+  limits) and reviewed the result.
+- **Learning and setup:** Seastar concepts (reactor, coroutines, `sharded<>`, DMA), and the Docker,
+  CMake and CLion setup on macOS.
+- **Testing and docs:** test scripts, edge cases and benchmarks, plus drafts of the README and the
+  OpenAPI spec.
