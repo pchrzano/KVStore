@@ -200,6 +200,7 @@ seastar::future<bool> Store::put(Key key, Value value) {
     auto units = co_await seastar::get_units(_append_lock, 1);
     std::vector<uint64_t> offsets = co_await append_records({{RecordType::put, &key, value.view()}});
     auto [it, inserted] = _data.insert_or_assign(key, offsets[0]);
+    _cache.put(key, std::move(value)); // only once it is on disk
     co_return inserted;
 }
 
@@ -207,6 +208,9 @@ seastar::future<std::optional<Value>> Store::get(Key key) const {
     auto it = _data.find(key);
     if (it == _data.end()) {
         co_return std::nullopt;
+    }
+    if (const Value* cached = _cache.get(key)) {
+        co_return *cached;
     }
     const uint64_t offset = it->second;
     const seastar::sstring path = file_name();
@@ -222,6 +226,12 @@ seastar::future<std::optional<Value>> Store::get(Key key) const {
     co_await f.close();
     if (ex) {
         std::rethrow_exception(ex);
+    }
+    // While we were reading, a put or delete may have changed the key. Only
+    // cache the value if it is still the latest one (a new put always gets
+    // a new offset).
+    if (auto now = _data.find(key); now != _data.end() && now->second == offset) {
+        _cache.put(key, *result);
     }
     co_return result;
 }

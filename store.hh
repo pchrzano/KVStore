@@ -6,6 +6,7 @@
 #include <seastar/core/sstring.hh>
 
 #include "key.hh"
+#include "lru_cache.hh"
 #include "value.hh"
 
 #include <cstddef>
@@ -29,6 +30,10 @@
 // A delete record has value size 0 and no value. Replaying a file in order
 // gives the current state: the last record for a key wins. The generation
 // changes when the data is resharded (see recovery.hh).
+//
+// The most recently used values are kept in an LRUCache, so a get of a hot
+// key needs no disk read. The index is always checked first, so a deleted
+// key left in the cache is never returned.
 class Store {
 public:
     enum class RecordType : uint8_t {
@@ -79,8 +84,9 @@ public:
     // updates it. Resolves to true if the key was created.
     seastar::future<bool> put(Key key, Value value);
 
-    // Reads the key's latest record from the data file. Resolves to the
-    // value, or nullopt if the key doesn't exist.
+    // Returns the value from the cache, or reads the key's latest record
+    // from the data file and caches it. Resolves to the value, or nullopt
+    // if the key doesn't exist.
     seastar::future<std::optional<Value>> get(Key key) const;
 
     // Appends a delete record (tombstone) and forgets the key.
@@ -108,6 +114,7 @@ private:
     seastar::sstring file_name() const;
 
     std::map<Key, uint64_t> _data; // key -> record offset in the data file
+    mutable LRUCache _cache;       // recently used values; filled by get() too
     uint64_t _generation = 0;
     seastar::semaphore _append_lock{1}; // one append at a time per shard
     bool _dir_synced = false;           // data file's directory entry fsynced

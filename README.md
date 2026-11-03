@@ -13,7 +13,8 @@ the framework behind ScyllaDB. It exposes a REST API and persists data to per-sh
   own thread — no locks.
 - **Storage.** Each shard appends records to `store-g<generation>-<shard>.dat` in the working
   directory and keeps an in-memory index `std::map<Key, offset>` pointing at each key's latest
-  record. Reads go to the file. `kv.meta` records the format version, shard count and generation.
+  record. Reads go to the file, except for the 100 most recently used values per shard, which are
+  kept in an LRU cache. `kv.meta` records the format version, shard count and generation.
 - **Durability.** Appends are serialized per shard, written with aligned DMA (`O_DIRECT`) writes and
   `fdatasync`ed before the request is answered.
 - **Listing.** `GET /api/v1/kv` collects each shard's (already sorted) keys and k-way merges them.
@@ -150,6 +151,7 @@ To see which shard a stopped thread belongs to, in gdb:
 | `webapi.hh/.cc` | REST handlers, routing to owner shards, Swagger UI |
 | `store.hh/.cc` | per-shard store: index, file format, DMA append and read, replay |
 | `recovery.hh/.cc` | startup: `kv.meta`, loading, resharding, cleanup of old generations |
+| `lru_cache.hh/.cc` | `LRUCache`: least recently used cache of up to 100 key-value pairs |
 | `key.hh/.cc` | `Key`: UTF-8 string up to 255 bytes, stored inline |
 | `value.hh/.cc` | `Value`: UTF-8 string of any length |
 | `utf8.hh/.cc` | UTF-8 validation |

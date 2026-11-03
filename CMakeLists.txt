@@ -16,6 +16,7 @@ add_executable(kv-app
     recovery.cc
     key.cc
     value.cc
+    lru_cache.cc
     utf8.cc)
 target_link_libraries(kv-app PRIVATE Seastar::seastar)
 
