@@ -38,7 +38,7 @@ Replaying a file from start to end gives the current state: the last record for 
 
 | Method | Path | Body | Responses |
 |---|---|---|---|
-| `PUT` | `/api/v1/kv/{key}` | the value (raw UTF-8) | `201` created, `200` updated, `400` invalid key, `500` value not valid UTF-8 |
+| `PUT` | `/api/v1/kv/{key}` | the value (raw UTF-8) | `201` created, `200` updated, `400` invalid key or value |
 | `GET` | `/api/v1/kv/{key}` | — | `200` `{"key":…,"value":…}`, `404`, `400` |
 | `DELETE` | `/api/v1/kv/{key}` | — | `204` deleted, `404`, `400` |
 | `GET` | `/api/v1/kv` | — | `200` `{"keys":[…]}` — all keys, sorted by bytes |

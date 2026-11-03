@@ -62,7 +62,7 @@ paths:
                 key: hello
                 created: false
         "400":
-          description: The key is not valid UTF-8 of at most 255 bytes.
+          description: The key is not valid UTF-8 of at most 255 bytes, or the body (value) is not valid UTF-8.
           content:
             application/json:
               schema:

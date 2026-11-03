@@ -124,7 +124,13 @@ ss::future<WebApi::reply_ptr> WebApi::put(request_ptr req, reply_ptr rep) {
     const Key key(key_str);
 
     // The whole body is the value. Needs content streaming enabled (see main).
-    Value value(co_await ss::util::read_entire_stream_contiguous(*req->content_stream));
+    ss::sstring body = co_await ss::util::read_entire_stream_contiguous(*req->content_stream);
+    if (!Value::is_valid(body)) {
+        rep->set_status(ss::http::reply::status_type::bad_request);
+        rep->write_body("json", ss::sstring(R"({"error":"value must be valid UTF-8"})"));
+        co_return std::move(rep);
+    }
+    Value value(std::move(body));
 
     // Runs on the shard that owns the key, against that shard's Store.
     bool created = co_await container().invoke_on(owner(key),
