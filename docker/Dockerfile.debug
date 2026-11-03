@@ -1,0 +1,12 @@
+# Seastar dev image + gdb, for CLion's Docker toolchain.
+#   docker build -t seastar-dev-debug -f docker/Dockerfile.debug docker
+FROM seastar-dev
+
+RUN apt-get update && apt-get install -y gdb && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Seastar uses these signals internally; without this gdb stops on them constantly.
+# (doc/tutorial.md, "Debugging with gdb")
+RUN mkdir -p /etc/gdb/gdbinit.d && printf '%s\n' \
+    'handle SIGUSR1 pass noprint nostop' \
+    'handle SIGALRM pass noprint nostop' \
+    > /etc/gdb/gdbinit.d/seastar.gdb

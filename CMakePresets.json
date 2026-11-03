@@ -1,0 +1,27 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "Debug (Docker)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "Seastar_DIR": "/seastar/build/release",
+        "CMAKE_MODULE_PATH": "/seastar/cmake"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Seastar Docker"
+        }
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    }
+  ]
+}

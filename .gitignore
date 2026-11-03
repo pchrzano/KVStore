@@ -1,0 +1,14 @@
+# Build output
+build/
+cmake-build-*/
+
+# IDE / OS
+.idea/
+.DS_Store
+
+# Empty mount points CLion creates for its containers
+/kv-app/
+/seastar/
+
+# Data files written by the app (store-<shard>.dat)
+*.dat

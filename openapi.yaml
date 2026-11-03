@@ -1,0 +1,169 @@
+openapi: 3.0.3
+info:
+  title: kv-app
+  version: 0.1.0
+  description: |
+    Key-value store built on Seastar. Every key is owned by one shard
+    (chosen by hashing the key); requests are forwarded to that shard.
+
+    This file is embedded into the binary at build time. Keep it in sync
+    with WebApi::register_routes() in webapi.cc.
+servers:
+  - url: /
+
+paths:
+  /api/v1/kv:
+    get:
+      operationId: list_keys
+      summary: List all keys, sorted
+      description: Collects the keys from every shard and merges them into one sorted list (byte order). Not paginated.
+      responses:
+        "200":
+          description: All keys, sorted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyList"
+              example:
+                keys: [apple, banana, cherry]
+
+  /api/v1/kv/{key}:
+    parameters:
+      - $ref: "#/components/parameters/Key"
+
+    put:
+      operationId: put
+      summary: Create the key, or update its value if it exists
+      description: The whole request body is stored as the value. It must be valid UTF-8 and may be empty.
+      requestBody:
+        required: false
+        content:
+          text/plain:
+            schema:
+              type: string
+            example: world
+      responses:
+        "201":
+          description: The key did not exist and was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PutResult"
+              example:
+                key: hello
+                created: true
+        "200":
+          description: The key existed and its value was replaced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PutResult"
+              example:
+                key: hello
+                created: false
+        "400":
+          description: The key is not valid UTF-8 of at most 255 bytes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: key must be valid UTF-8 of at most 255 bytes
+
+    get:
+      operationId: get
+      summary: Get the value of a key
+      responses:
+        "200":
+          description: The key exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetResult"
+              example:
+                key: hello
+                value: world
+        "400":
+          description: The key is not valid UTF-8 of at most 255 bytes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: key must be valid UTF-8 of at most 255 bytes
+        "404":
+          description: The key does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: key not found
+
+    delete:
+      operationId: delete_key
+      summary: Delete a key
+      description: Appends a delete record (tombstone) to the owner shard's data file and removes the key.
+      responses:
+        "204":
+          description: The key existed and was deleted.
+        "400":
+          description: The key is not valid UTF-8 of at most 255 bytes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: key must be valid UTF-8 of at most 255 bytes
+        "404":
+          description: The key does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: key not found
+
+components:
+  parameters:
+    Key:
+      name: key
+      in: path
+      required: true
+      description: The key. URL-encode special characters (e.g. a space as %20); it may not contain "/".
+      schema:
+        type: string
+      example: hello
+
+  schemas:
+    PutResult:
+      type: object
+      required: [key, created]
+      properties:
+        key:
+          type: string
+        created:
+          type: boolean
+          description: true if the key was created, false if it was updated.
+    KeyList:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: string
+    GetResult:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
