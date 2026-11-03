@@ -44,7 +44,9 @@ int main(int argc, char** argv) {
     ss::app_template app;
     app.add_options()
         ("address", bpo::value<ss::sstring>()->default_value("0.0.0.0"), "HTTP listen address")
-        ("port", bpo::value<uint16_t>()->default_value(8080), "HTTP listen port");
+        ("port", bpo::value<uint16_t>()->default_value(8080), "HTTP listen port")
+        ("cache-size", bpo::value<size_t>()->default_value(LRUCache::default_capacity),
+            "key-value pairs cached per shard (0 disables the cache)");
 
     return app.run(argc, argv, [&app] {
         return ss::async([&app] {
@@ -52,9 +54,12 @@ int main(int argc, char** argv) {
             const auto& cfg = app.configuration();
             const auto address = cfg["address"].as<ss::sstring>();
             const auto port = cfg["port"].as<uint16_t>();
+            const auto cache_size = cfg["cache-size"].as<size_t>();
 
+            // Every shard's WebApi is constructed with cache_size.
             ss::sharded<WebApi> api;
-            api.start().get();
+            api.start(cache_size).get();
+            kvlog.info("cache: {} key-value pairs per shard", cache_size);
             auto stop_api = ss::defer([&api]() noexcept { api.stop().get(); });
 
             // Load (or reshard) the data files before serving anything.

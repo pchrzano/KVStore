@@ -36,6 +36,10 @@
 // key left in the cache is never returned.
 class Store {
 public:
+    // `cache_capacity`: how many key-value pairs this shard's cache holds.
+    explicit Store(std::size_t cache_capacity = LRUCache::default_capacity)
+        : _cache(cache_capacity) {}
+
     enum class RecordType : uint8_t {
         put = 1,
         del = 2,

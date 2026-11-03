@@ -17,6 +17,9 @@
 // provides container(), so a handler can call the instance on another shard.
 class WebApi : public seastar::peering_sharded_service<WebApi> {
 public:
+    // `cache_capacity`: key-value pairs cached by this shard's Store.
+    explicit WebApi(std::size_t cache_capacity) : _store(cache_capacity) {}
+
     void register_routes(seastar::httpd::routes& r);
 
     // This shard's Store (used at startup by recover()).

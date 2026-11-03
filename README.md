@@ -13,8 +13,9 @@ the framework behind ScyllaDB. It exposes a REST API and persists data to per-sh
   own thread — no locks.
 - **Storage.** Each shard appends records to `store-g<generation>-<shard>.dat` in the working
   directory and keeps an in-memory index `std::map<Key, offset>` pointing at each key's latest
-  record. Reads go to the file, except for the 100 most recently used values per shard, which are
-  kept in an LRU cache. `kv.meta` records the format version, shard count and generation.
+  record. Reads go to the file, except for the most recently used values, which each shard keeps
+  in an LRU cache (`--cache-size` pairs per shard, default 100). Newly written values go into the
+  cache too. `kv.meta` records the format version, shard count and generation.
 - **Durability.** Appends are serialized per shard, written with aligned DMA (`O_DIRECT`) writes and
   `fdatasync`ed before the request is answered.
 - **Listing.** `GET /api/v1/kv` collects each shard's (already sorted) keys and k-way merges them.
@@ -46,7 +47,9 @@ Before serving, the server rebuilds its index from the data files ([`recovery.hh
 
 ### Limits
 
-- Keys: valid UTF-8, 0–255 bytes, no `/`. Values: valid UTF-8, any length.
+- Keys: valid UTF-8, 1–255 bytes. In the URL a key is percent-encoded, so a key containing `/` is
+  written as `%2F` (e.g. `/api/v1/kv/a%2Fb` is the key `a/b`); a raw `/` gives 404. Values: valid
+  UTF-8, any length.
 - Files are only compacted by resharding; otherwise old versions and tombstones stay.
 - Records have no checksum, so a torn write whose bytes happen to look like a valid record would
   not be detected.
@@ -126,6 +129,7 @@ ninja -C build/release
 | `--port` | `8080` | HTTP listen port (inside the container) |
 | `--smp` | all cores | number of shards (Seastar) |
 | `--memory` | most of RAM | memory for the app (Seastar) |
+| `--cache-size` | `100` | key-value pairs cached per shard; `0` disables the cache |
 | `--unsafe-bypass-fsync 1` | off | skip `fdatasync` — faster, may lose data; for testing only |
 | `--logger-log-level kvapp=warn` | `info` | silence the per-request "Putting…" log |
 
@@ -151,7 +155,7 @@ To see which shard a stopped thread belongs to, in gdb:
 | `webapi.hh/.cc` | REST handlers, routing to owner shards, Swagger UI |
 | `store.hh/.cc` | per-shard store: index, file format, DMA append and read, replay |
 | `recovery.hh/.cc` | startup: `kv.meta`, loading, resharding, cleanup of old generations |
-| `lru_cache.hh/.cc` | `LRUCache`: least recently used cache of up to 100 key-value pairs |
+| `lru_cache.hh/.cc` | `LRUCache`: least recently used cache of a fixed number of key-value pairs |
 | `key.hh/.cc` | `Key`: UTF-8 string up to 255 bytes, stored inline |
 | `value.hh/.cc` | `Value`: UTF-8 string of any length |
 | `utf8.hh/.cc` | UTF-8 validation |
